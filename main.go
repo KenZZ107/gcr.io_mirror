@@ -14,12 +14,39 @@ import (
 	"gopkg.in/alecthomas/kingpin.v2"
 	"gopkg.in/yaml.v3"
 	"io"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strings"
 	"text/template"
 )
+
+var resultTpl = `
+{{ if .Success }}
+**转换完成**
+^^^bash
+{{ if .Registry }}
+docker login -u{{ .RegistryUser }} {{ .Registry }}
+{{ end }}
+#原镜像
+{{ .OriginImageName }}
+
+#转换后镜像
+{{ .TargetImageName }}
+
+
+#下载并重命名镜像
+docker pull {{ .TargetImageName }} {{ if .Platform }} --platform {{ .Platform }} {{ end }}
+
+docker tag  {{ .TargetImageName }} {{ index (split .OriginImageName "@") 0 }}
+
+docker images | grep $(echo {{ .OriginImageName }} |awk -F':' '{print $1}')
+
+^^^
+{{ else }}
+**转换失败**
+详见 [构建任务](https://github.com/{{ .GhUser }}/{{ .Repo }}/actions/runs/{{ .RunId }})
+{{ end }}
+`
 
 func main() {
 	ctx := context.Background()
@@ -56,7 +83,7 @@ func main() {
 		},
 	}
 
-	rulesFile, err := ioutil.ReadFile("rules.yaml")
+	rulesFile, err := os.ReadFile("rules.yaml")
 	if err == nil {
 		rules := make(map[string]string)
 		err2 := yaml.Unmarshal(rulesFile, &rules)
@@ -87,7 +114,7 @@ func main() {
 
 	fmt.Println("添加 构建进展 Comment")
 	commentIssues(issue, cli, ctx, "[构建进展](https://github.com/"+config.GhUser+"/"+config.Repo+"/actions/runs/"+config.RunId+")")
-	err, originImageName, targetImageName := mirrorByIssues(issue, config)
+	err, originImageName, targetImageName, platform := mirrorByIssues(issue, config)
 	if err != nil {
 		commentErr := commentIssues(issue, cli, ctx, err.Error())
 		if commentErr != nil {
@@ -101,6 +128,7 @@ func main() {
 		RegistryUser    string
 		OriginImageName string
 		TargetImageName string
+		Platform        string
 		GhUser          string
 		Repo            string
 		RunId           string
@@ -110,13 +138,17 @@ func main() {
 		RegistryUser:    config.RegistryUserName,
 		OriginImageName: originImageName,
 		TargetImageName: targetImageName,
+		Platform:        platform,
 		GhUser:          *ghUser,
 		Repo:            *ghRepo,
 		RunId:           *runId,
 	}
 
 	var buf bytes.Buffer
-	tmpl, err := template.New("result").Parse(resultTpl)
+	funcmap := template.FuncMap{
+		"split": strings.Split,
+	}
+	tmpl, err := template.New("result").Funcs(funcmap).Parse(resultTpl)
 	err = tmpl.Execute(&buf, &result)
 
 	fmt.Println("添加 转换结果 Comment")
@@ -125,39 +157,15 @@ func main() {
 	commentIssues(issue, cli, ctx, strings.ReplaceAll(res, "^", "`"))
 
 	fmt.Println("添加 转换结果 Label")
-	issuesAddLabels(issue, cli, ctx, result.Success)
+	var labels []string
+	if len(platform) > 0 {
+		labels = append(labels, "platform")
+	}
+	issuesAddLabels(issue, cli, ctx, result.Success, labels)
 
 	fmt.Println("关闭 Issues")
 	issuesClose(issue, cli, ctx)
 }
-
-var resultTpl = `
-{{ if .Success }}
-**转换完成**
-^^^bash
-{{ if .Registry }}
-docker login -u{{ .RegistryUser }} {{ .Registry }}
-{{ end }}
-#原镜像
-{{ .OriginImageName }}
-
-#转换后镜像
-{{ .TargetImageName }}
-
-
-#下载并重命名镜像
-docker pull {{ .TargetImageName }}
-
-docker tag  {{ .TargetImageName }} {{ .OriginImageName }}
-
-docker images | grep $(echo {{ .OriginImageName }} |awk -F':' '{print $1}')
-
-^^^
-{{ else }}
-**转换失败**
-详见 [构建任务](https://github.com/{{ .GhUser }}/{{ .Repo }}/actions/runs/{{ .RunId }})
-{{ end }}
-`
 
 func issuesClose(issues *github.Issue, cli *github.Client, ctx context.Context) {
 	names := strings.Split(*issues.RepositoryURL, "/")
@@ -166,14 +174,19 @@ func issuesClose(issues *github.Issue, cli *github.Client, ctx context.Context) 
 		State: &state,
 	})
 }
-func issuesAddLabels(issues *github.Issue, cli *github.Client, ctx context.Context, success bool) {
+func issuesAddLabels(issues *github.Issue, cli *github.Client, ctx context.Context, success bool, labels []string) {
 	names := strings.Split(*issues.RepositoryURL, "/")
-
 	label := "success"
 	if !success {
 		label = "failed"
 	}
-	cli.Issues.AddLabelsToIssue(ctx, names[len(names)-2], names[len(names)-1], issues.GetNumber(), []string{label})
+	if labels == nil {
+		labels = []string{label}
+	} else {
+		labels = append(labels, label)
+	}
+
+	cli.Issues.AddLabelsToIssue(ctx, names[len(names)-2], names[len(names)-1], issues.GetNumber(), labels)
 }
 func commentIssues(issues *github.Issue, cli *github.Client, ctx context.Context, comment string) error {
 	names := strings.Split(*issues.RepositoryURL, "/")
@@ -183,23 +196,35 @@ func commentIssues(issues *github.Issue, cli *github.Client, ctx context.Context
 	return err
 }
 
-func mirrorByIssues(issues *github.Issue, config *Config) (err error, originImageName string, targetImageName string) {
+func mirrorByIssues(issues *github.Issue, config *Config) (err error, originImageName string, targetImageName string, platform string) {
 	// 去掉前缀 [PORTER] 整体去除前后空格
 	originImageName = strings.TrimSpace(strings.Replace(*issues.Title, "[PORTER]", "", 1))
+	names := strings.Split(originImageName, "|")
+
+	originImageName = names[0]
+	if len(names) > 1 {
+		platform = names[1]
+	}
+
+	if strings.Index(originImageName, ".") > strings.Index(originImageName, "/") {
+		originImageName = "docker.io/" + originImageName
+	}
+
 	targetImageName = originImageName
 
 	if strings.ContainsAny(originImageName, "@") {
-		return errors.New("@" + *issues.GetUser().Login + " 不支持同步带摘要信息的镜像"), originImageName, targetImageName
+		targetImageName = strings.Split(originImageName, "@")[0]
 	}
 
 	registrys := []string{}
+
 	for k, v := range config.Rules {
 		targetImageName = regexp.MustCompile(k).ReplaceAllString(targetImageName, v)
 		registrys = append(registrys, k)
 	}
 
 	if strings.EqualFold(targetImageName, originImageName) {
-		return errors.New("@" + *issues.GetUser().Login + " 暂不支持同步" + originImageName + ",目前仅支持同步 `" + strings.Join(registrys, " ,") + "`镜像"), originImageName, targetImageName
+		return errors.New("@" + *issues.GetUser().Login + " 暂不支持同步" + originImageName + ",目前仅支持同步 `" + strings.Join(registrys, " ,") + "`镜像"), originImageName, targetImageName, platform
 	}
 
 	targetImageName = strings.ReplaceAll(targetImageName, "/", ".")
@@ -215,29 +240,29 @@ func mirrorByIssues(issues *github.Issue, config *Config) (err error, originImag
 	//execCmd("docker", "login", config.Registry, "-u", config.RegistryUserName, "-p", config.RegistryPassword)
 	cli, ctx, err := dockerLogin(config)
 	if err != nil {
-		return errors.New("@" + config.GhUser + " ,docker login 报错 `" + err.Error() + "`"), originImageName, targetImageName
+		return errors.New("@" + config.GhUser + " ,docker login 报错 `" + err.Error() + "`"), originImageName, targetImageName, platform
 	}
 
 	//execCmd("docker", "pull", originImageName)
-	err = dockerPull(originImageName, cli, ctx)
+	err = dockerPull(originImageName, platform, cli, ctx)
 
 	if err != nil {
-		return errors.New("@" + *issues.GetUser().Login + " ,docker pull 报错 `" + err.Error() + "`"), originImageName, targetImageName
+		return errors.New("@" + *issues.GetUser().Login + " ,docker pull 报错 `" + err.Error() + "`"), originImageName, targetImageName, platform
 	}
 
 	//execCmd("docker", "tag", originImageName, targetImageName)
 	err = dockerTag(originImageName, targetImageName, cli, ctx)
 	if err != nil {
-		return errors.New("@" + *issues.GetUser().Login + " ,docker tag 报错 `" + err.Error() + "`"), originImageName, targetImageName
+		return errors.New("@" + *issues.GetUser().Login + " ,docker tag 报错 `" + err.Error() + "`"), originImageName, targetImageName, platform
 	}
 
 	//execCmd("docker", "push", targetImageName)
-	err = dockerPush(targetImageName, cli, ctx, config)
+	err = dockerPush(targetImageName, platform, cli, ctx, config)
 	if err != nil {
-		return errors.New("@" + *issues.GetUser().Login + " ,docker push 报错 `" + err.Error() + "`"), originImageName, targetImageName
+		return errors.New("@" + *issues.GetUser().Login + " ,docker push 报错 `" + err.Error() + "`"), originImageName, targetImageName, platform
 	}
 
-	return nil, originImageName, targetImageName
+	return nil, originImageName, targetImageName, platform
 }
 
 func dockerLogin(config *Config) (*client.Client, context.Context, error) {
@@ -258,9 +283,11 @@ func dockerLogin(config *Config) (*client.Client, context.Context, error) {
 	}
 	return cli, ctx, nil
 }
-func dockerPull(originImageName string, cli *client.Client, ctx context.Context) error {
+func dockerPull(originImageName string, platform string, cli *client.Client, ctx context.Context) error {
 	fmt.Println("docker pull ", originImageName)
-	pullOut, err := cli.ImagePull(ctx, originImageName, types.ImagePullOptions{})
+	pullOut, err := cli.ImagePull(ctx, originImageName, types.ImagePullOptions{
+		Platform: platform,
+	})
 	if err != nil {
 		return err
 	}
@@ -273,7 +300,7 @@ func dockerTag(originImageName string, targetImageName string, cli *client.Clien
 	err := cli.ImageTag(ctx, originImageName, targetImageName)
 	return err
 }
-func dockerPush(targetImageName string, cli *client.Client, ctx context.Context, config *Config) error {
+func dockerPush(targetImageName string, platform string, cli *client.Client, ctx context.Context, config *Config) error {
 	fmt.Println("docker push ", targetImageName)
 	authConfig := types.AuthConfig{
 		Username: config.RegistryUserName,
@@ -290,6 +317,7 @@ func dockerPush(targetImageName string, cli *client.Client, ctx context.Context,
 
 	pushOut, err := cli.ImagePush(ctx, targetImageName, types.ImagePushOptions{
 		RegistryAuth: authStr,
+		Platform:     platform,
 	})
 	if err != nil {
 		return err

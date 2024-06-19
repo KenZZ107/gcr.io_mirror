@@ -44,7 +44,13 @@ Uses/如何拉取新镜像
 
 **Issues 必须带 `porter` label，** 简单来说就是通过模板创建就没问题，别抖机灵自己瞎弄。
 
-**标题必须为 `[PORTER]镜像名:tag` 的格式，** 例如`[PORTER]k8s.gcr.io/federation-controller-manager-arm64:v1.3.1-beta.1`,`[PORTER]gcr.io/google-containers/federation-controller-manager-arm64:v1.3.1-beta.1`
+**标题必须为 `[PORTER]镜像名:tag` 的格式，** 例如
+- `[PORTER]k8s.gcr.io/federation-controller-manager-arm64:v1.3.1-beta.1`
+- `[PORTER]gcr.io/google-containers/federation-controller-manager-arm64:v1.3.1-beta.1`
+
+**特别的**，如果要指定平台的话 `[PORTER]镜像名:tag|平台类型`
+- `[PORTER]busybox:latest|linux/arm64`
+- `[PORTER]busybox:latest|linux/arm/v7`
 
 issues的内容无所谓，可以为空
 
@@ -60,7 +66,9 @@ Fork/分叉代码自行维护
 
 - 必须: <https://github.com/anjia0532/gcr.io_mirror/fork> 点击连接在自己账号下分叉出 `gcr.io_mirror` 项目
 - 可选: 修改 [./rules.yaml](./rules.yaml) 增加暂未支持的镜像库
+- 在 [./settings/actions](../../settings/actions) 的 `Workflow permissions` 选项中，授予读写权限
 - 在 [./settings/secrets/actions](../../settings/secrets/actions) 创建自己的参数
+- 随便新建个issues，然后在右侧创建个名为 `porter` 和 `question` 的 label，后续通过模板创建时会自动带上。 详见 https://github.com/anjia0532/gcr.io_mirror/issues/3893
 
 `DOCKER_REGISTRY`: 如果推到 docker hub 为空即可
 
